@@ -12,3 +12,6 @@ deploy/.env
 # Package cache and tools of examples/nuget.config
 examples/.nuget-packages/
 examples/.tools/
+
+# Python bytecode (scripts/)
+__pycache__/

@@ -206,6 +206,38 @@ uploaded, the service index advertises `VulnerabilityInfo/6.7.0`, restore
 reports `NU1901`-`NU1904` warnings, `dotnet list package --vulnerable` works,
 and Visual Studio shows the advisories.
 
+### Migrating from Nexus Repository
+
+`scripts/migrate-from-nexus.py` copies every NuGet package from Sonatype Nexus
+Repository 3.67 or later into Nugget, byte for byte. It needs only Python 3.8+
+(no extra modules), so it runs on any server that can reach both.
+
+```bash
+export NEXUS_PASSWORD=...          # or a user token passcode
+scripts/migrate-from-nexus.py \
+    --nexus-url https://nexus.corp.example --nexus-user migration \
+    --nugget-url https://nuget.corp.example --nugget-api-key "$KEY" \
+    --failures failures.tsv
+```
+
+* All NuGet **hosted and proxy** repositories are copied (proxies hold the
+  packages Nexus cached from nuget.org); groups are skipped because they only
+  repeat their members. Choose with `--repository NAME` (repeatable) or
+  `--hosted-only`, and preview with `--dry-run`.
+* The Nexus user needs to browse and read the NuGet repositories
+  (`nx-repository-view-nuget-*-browse` and `-read`). Without `--nexus-user`
+  Nexus is read anonymously.
+* Every download is checked against the checksum Nexus reports. Package IDs
+  get their exact casing from the package itself, also where Nexus lists
+  proxied packages in lower case.
+* Run it as often as you like: versions Nugget already has are compared by
+  SHA-512 and skipped without downloading. A version that exists in both with
+  *different* content is reported as a conflict, never overwritten.
+* `--parallel N` (default 4) copies several packages at once; `--ca-file`
+  trusts an internal CA. Exit code 0 means everything was copied, 1 that some
+  packages failed or conflict (listed in `--failures`), 2 that it could not
+  run at all (settings, login, connection).
+
 ## HTTP API
 
 Read endpoints are anonymous; write endpoints need the API key in
