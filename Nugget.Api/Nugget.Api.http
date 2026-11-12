@@ -1,0 +1,50 @@
+@Nugget_HostAddress = http://localhost:5080
+@ApiKey = dev-api-key
+
+### Service index
+GET {{Nugget_HostAddress}}/v3/index.json
+
+### Upload a package (raw body, like curl --data-binary)
+PUT {{Nugget_HostAddress}}/api/v2/package
+X-NuGet-ApiKey: {{ApiKey}}
+Content-Type: application/octet-stream
+
+< ./newtonsoft.json.13.0.3.nupkg
+
+### Versions of a package (flat container)
+GET {{Nugget_HostAddress}}/v3-flatcontainer/newtonsoft.json/index.json
+
+### Package metadata (registration)
+GET {{Nugget_HostAddress}}/v3/registration5-gz-semver2/newtonsoft.json/index.json
+
+### Search
+GET {{Nugget_HostAddress}}/query?q=json&prerelease=true&semVerLevel=2.0.0&take=10
+
+### Autocomplete
+GET {{Nugget_HostAddress}}/autocomplete?q=newtonsoft
+
+### Unlist
+DELETE {{Nugget_HostAddress}}/api/v2/package/Newtonsoft.Json/13.0.3
+X-NuGet-ApiKey: {{ApiKey}}
+
+### Relist
+POST {{Nugget_HostAddress}}/api/v2/package/Newtonsoft.Json/13.0.3
+X-NuGet-ApiKey: {{ApiKey}}
+
+### Delete for good
+DELETE {{Nugget_HostAddress}}/api/v2/package/Newtonsoft.Json/13.0.3?purge=true
+X-NuGet-ApiKey: {{ApiKey}}
+
+### Upload vulnerability data (from https://api.nuget.org/v3/vulnerabilities/index.json)
+PUT {{Nugget_HostAddress}}/api/v2/vulnerabilities/base
+X-NuGet-ApiKey: {{ApiKey}}
+Content-Type: application/json
+
+< ./vulnerability.base.json
+
+### Rebuild the catalog from S3
+POST {{Nugget_HostAddress}}/api/v2/admin/rebuild
+X-NuGet-ApiKey: {{ApiKey}}
+
+### Readiness
+GET {{Nugget_HostAddress}}/health/ready

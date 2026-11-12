@@ -1,0 +1,43 @@
+# Nugget as a drop-in replacement for api.nuget.org.
+#
+#   cd deploy
+#   ./generate-certs.sh nuget.corp.example   # or use certificates from your CA
+#   cat > .env <<ENV
+#   NUGGET_API_KEY=$(openssl rand -hex 24)
+#   S3_ACCESS_KEY=...
+#   S3_SECRET_KEY=...
+#   ENV
+#   docker compose up -d
+#
+# Then point api.nuget.org at this host in DNS and trust certs/ca.crt on
+# developer and build machines (see README).
+services:
+  nugget:
+    image: ghcr.io/linus-berg/nugget/api:latest
+    # build: { context: .., dockerfile: Nugget.Api/Dockerfile }
+    restart: unless-stopped
+    ports:
+      - "443:8443"
+      - "80:8080"
+    environment:
+      Nugget__ApiKey: ${NUGGET_API_KEY:?set NUGGET_API_KEY in .env}
+      ASPNETCORE_HTTP_PORTS: "8080"
+      ASPNETCORE_HTTPS_PORTS: "8443"
+      ASPNETCORE_Kestrel__Certificates__Default__Path: /certs/nugget.crt
+      ASPNETCORE_Kestrel__Certificates__Default__KeyPath: /certs/nugget.key
+      Storage__ServiceUrl: ${S3_URL:-https://minio.corp.example:9000}
+      Storage__AccessKey: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      Storage__SecretKey: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+      Storage__Bucket: ${S3_BUCKET:-nuget}
+      # Trusts every certificate in /certs/ca in addition to the system CAs,
+      # e.g. the internal CA that signed MinIO's certificate.
+      SSL_CERT_DIR: /etc/ssl/certs:/certs/ca
+    volumes:
+      - ./certs:/certs:ro
+      # - /etc/pki/internal-ca:/certs/ca:ro
+    healthcheck:
+      # The runtime image has no curl; use bash's /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"ok\"' <&3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
