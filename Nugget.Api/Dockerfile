@@ -3,6 +3,8 @@ FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 ARG TARGETARCH
 ARG BUILD_CONFIGURATION=Release
 ARG SKIP_TESTS=false
+# Set by the release workflow from the release tag (v1.2.3 -> 1.2.3).
+ARG VERSION=0.0.0-dev
 WORKDIR /src
 
 COPY ["Nugget.sln", "./"]
@@ -18,7 +20,8 @@ RUN if [ "$SKIP_TESTS" != "true" ]; then \
         -c $BUILD_CONFIGURATION --no-restore; \
     fi
 RUN dotnet publish "Nugget.Api/Nugget.Api.csproj" -a $TARGETARCH \
-      -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+      -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false \
+      /p:Version=$VERSION
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app

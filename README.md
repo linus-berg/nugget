@@ -381,4 +381,13 @@ against the server.
 Build the image with `docker build -f Nugget.Api/Dockerfile .` (the tests run
 during the build; `--build-arg SKIP_TESTS=true` skips them).
 
+### Releases
+
+Publishing a GitHub release with a tag like `v0.0.1` runs
+`.github/workflows/release.yml`: it runs the tests, builds the image for
+`linux/amd64` and `linux/arm64` and pushes it to
+`ghcr.io/linus-berg/nugget/api` as `0.0.1`, `0.0` and `latest` (prereleases
+such as `v0.1.0-rc.1` only get their own tag). The version is stamped into the
+build; it is logged at startup and reported by `/health`.
+
 Code style follows `Nugget.sln.DotSettings` (Rider / ReSharper).

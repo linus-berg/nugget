@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using Nugget.Api.Catalog;
 using Nugget.Api.Configuration;
 using Nugget.Api.Endpoints;
+using Nugget.Api.Json;
 using Nugget.Api.Packages;
 using Nugget.Api.Storage;
 using Nugget.Api.Vulnerabilities;
@@ -102,6 +103,7 @@ public class Program {
     NuggetOptions options = app.Services
                                .GetRequiredService<IOptions<NuggetOptions>>()
                                .Value;
+    logger.LogInformation("Nugget {Version}", NuggetVersion.S_CURRENT);
     if (options.GetApiKeys().Count == 0) {
       logger.LogWarning(
         "No API key configured: uploads are disabled. Set Nugget__ApiKey " +

@@ -1,0 +1,70 @@
+# Builds the container image and pushes it to the GitHub container registry
+# whenever a release is published. For a release tagged v1.2.3 that is:
+#
+#   ghcr.io/<owner>/<repo>/api:1.2.3
+#   ghcr.io/<owner>/<repo>/api:1.2      (not for prereleases such as v1.2.3-rc.1)
+#   ghcr.io/<owner>/<repo>/api:1        (from v1.0.0 on)
+#   ghcr.io/<owner>/<repo>/api:latest   (not for prereleases)
+name: Release image
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-image-${{ github.ref }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/api
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      # Once here, rather than once per platform inside the image build.
+      - name: Test
+        run: dotnet test Nugget.sln -c Release
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The Dockerfile cross-compiles, so arm64 needs no emulation.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Nugget.Api/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            SKIP_TESTS=true
+            VERSION=${{ steps.meta.outputs.version }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

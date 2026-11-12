@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Reflection;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -36,6 +37,17 @@ public sealed partial class NuggetJsonContext : JsonSerializerContext;
 public sealed class HealthResponse {
   public required string Status { get; init; }
   public int? Packages { get; init; }
+  public string Version { get; init; } = NuggetVersion.S_CURRENT;
+}
+
+public static class NuggetVersion {
+  /// <summary>The release version (<c>/p:Version</c>), without build metadata.</summary>
+  public static readonly string S_CURRENT =
+    (typeof(NuggetVersion).Assembly
+                          .GetCustomAttribute<
+                            AssemblyInformationalVersionAttribute>()
+                          ?.InformationalVersion ??
+     "0.0.0").Split('+')[0];
 }
 
 public static class NuggetJson {
