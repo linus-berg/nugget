@@ -34,6 +34,7 @@ read -r -a curl_opts <<< "${CURL_OPTS:-}"
 EXAMPLES=(
   Newtonsoft.Json@13.0.3
   Serilog@4.0.0
+  Serilog@4.4.0
   Serilog.Sinks.Console@6.0.0
   Humanizer.Core@2.14.1
   Polly.Core@8.9.1
