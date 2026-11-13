@@ -238,6 +238,39 @@ scripts/migrate-from-nexus.py \
   packages failed or conflict (listed in `--failures`), 2 that it could not
   run at all (settings, login, connection).
 
+### Importing packages from a directory
+
+`scripts/import-from-directory.py` uploads every `.nupkg` found under one or
+more directories, searched recursively, byte for byte. Use it for packages
+already on disk, such as an archive of nuget.org downloads brought into an
+offline network. Like the Nexus script it needs only Python 3.8+.
+
+```bash
+scripts/import-from-directory.py \
+    --root /srv/nuget-packages \
+    --nugget-url https://nuget.corp.example --nugget-api-key "$KEY" \
+    --failures failures.tsv --error-dir /srv/nuget-errors
+```
+
+* Any layout works: ID and version are read from each package's `.nuspec`,
+  not from its path. `--root` is required and can be repeated. Symbol
+  packages (`.snupkg`, `.symbols.nupkg`) are ignored.
+* A version stored more than once (e.g. in several dated directories) is
+  uploaded once, from the first copy in path order. A copy with different
+  content is reported in `--failures`, never uploaded.
+* `--error-dir DIR` moves every file that was not uploaded (unreadable,
+  failed, conflict, differing copy) to the same path under `DIR` as under
+  `--root`, e.g. `ROOT/a/b.nupkg` to `DIR/a/b.nupkg`, so you can see what
+  failed in which directory. Move a file back under `--root` to try it again.
+  It needs a single `--root`, must not be inside it, and moves nothing with
+  `--dry-run`.
+* Run it as often as you like: versions Nugget already has are compared by
+  size and SHA-512 and skipped. A different package with the same ID and
+  version is reported as a conflict, never overwritten. Preview with
+  `--dry-run`.
+* `--parallel`, `--ca-file` and the exit codes work as in the Nexus script.
+  Files that are not readable packages also count as failures.
+
 ## HTTP API
 
 Read endpoints are anonymous; write endpoints need the API key in
