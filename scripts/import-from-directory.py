@@ -1,33 +1,41 @@
 #!/usr/bin/env python3
 """Uploads every NuGet package found under a directory tree into Nugget.
 
-Searches the given directories recursively for .nupkg files, in any layout.
-Packages are uploaded byte for byte, so their signatures stay valid. Needs
-Python 3.8+ and nothing outside the standard library.
+Walks the given directories recursively, in any layout, and uploads each
+.nupkg file as it is found: the tree is never loaded into memory as a whole,
+so even very large archives work. Packages are uploaded byte for byte, so
+their signatures stay valid. Needs Python 3.8+ and nothing outside the
+standard library.
 
     scripts/import-from-directory.py \\
         --root /srv/nuget-packages \\
         --nugget-url https://nuget.corp.example --nugget-api-key "$NUGGET_API_KEY"
 
-ID and version come from each package's .nuspec, not from its file name. When
-the same version is found more than once (e.g. in several dated directories),
-the first copy in path order is uploaded; a copy with different content is
-reported as a conflict. Symbol packages (.snupkg, .symbols.nupkg) are ignored.
+Every step is logged with a timestamp: each directory directly below the root
+as it is scanned, and for every package its path, ID, version and size, what
+Nugget already has, the upload and its result.
+
+ID and version come from each package's .nuspec, not from its file name.
+Symbol packages (.snupkg, .symbols.nupkg) are ignored. Versions Nugget already
+has are compared by size and SHA-512: identical ones are skipped, different
+ones are reported as conflicts and never overwritten. The same goes for a
+version stored more than once (e.g. in several dated directories): the first
+copy found is uploaded, later copies are compared with it. (--dry-run uploads
+nothing, so it cannot spot such duplicates.)
 
 With --error-dir, every file that could not be uploaded (unreadable, failed,
-conflict, differing copy) is moved there, to the same path relative to the
-error directory as it had relative to --root, so failures are easy to find by
-directory. Move a file back under --root to try it again.
+conflict) is moved there, to the same path relative to the error directory as
+it had relative to --root, so failures are easy to find by directory. Move a
+file back under --root to try it again.
 
-Safe to run again: versions Nugget already has are skipped without being
-uploaded (compared by size and SHA-512), so a second run only uploads what is
-new or failed before (and was not moved away with --error-dir).
+Safe to run again: a second run only uploads what is new or failed before
+(and was not moved away with --error-dir).
 
 Settings can also come from the environment: NUGGET_URL, NUGGET_API_KEY.
 
 Exit codes: 0 everything was uploaded, 1 some packages failed, conflict or
 could not be read (see --failures), 2 nothing was uploaded (bad settings or
-connection).
+connection), 130 interrupted.
 """
 
 from __future__ import annotations
@@ -43,35 +51,39 @@ import shutil
 import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 USER_AGENT = "nugget-directory-import/1.0"
 CHUNK = 1024 * 1024
 MAX_NUSPEC_BYTES = 8 * 1024 * 1024  # the same limit as Nugget's
+CONFLICT = "Nugget has a different package with this ID and version"
+# Outcomes, in the order of the summary, with how the summary names them.
+OUTCOMES = (
+    ("added", "added"),
+    ("present", "already in Nugget"),
+    ("would add", "would be uploaded"),
+    ("conflict", "conflict"),
+    ("failed", "failed"),
+    ("unreadable", "unreadable"),
+    ("unreadable directory", "unreadable director(ies)"),
+    ("not moved", "could not be moved to the error dir"),
+)
 
 
 @dataclass
 class LocalPackage:
     path: str
-    root: str
     size: int
     id: str
     version: str
     _sha512: Optional[str] = field(default=None, repr=False)
-
-    @property
-    def key(self) -> Tuple[str, str]:
-        return self.id.lower(), normalize_version(self.version)
-
-    @property
-    def display_path(self) -> str:
-        return os.path.relpath(self.path, self.root)
 
     def sha512(self) -> str:
         """Base64 SHA-512 of the file, as Nugget reports it (computed once)."""
@@ -84,13 +96,36 @@ class LocalPackage:
         return self._sha512
 
 
-@dataclass(frozen=True)
-class Failure:
+@dataclass
+class Result:
+    """What happened to one package file."""
+    number: int
+    root: str
     path: str
-    id: str
-    version: str
-    reason: str
-    root: str = ""  # set when path is a package file under this root
+    outcome: str = "failed"  # one of OUTCOMES
+    detail: str = ""
+    package: Optional[LocalPackage] = None
+
+    @property
+    def relative_path(self) -> str:
+        return os.path.relpath(self.path, self.root)
+
+    @property
+    def tag(self) -> str:
+        """[number] plus ID and version once known, to tell interleaved lines apart."""
+        if self.package is None:
+            return f"[{self.number}]"
+        return f"[{self.number}] {self.package.id} {self.package.version}:"
+
+    def describe(self) -> str:
+        if self.outcome == "added":
+            return f"{self.tag} added ({self.detail})"
+        if self.outcome == "present":
+            return f"{self.tag} skipped, already in Nugget ({self.detail})"
+        if self.outcome == "would add":
+            return (f"{self.tag} would be uploaded" + (f", {self.detail}" if self.detail else "")
+                    + " (dry run)")
+        return f"{self.tag} {self.outcome}: {self.detail} ({self.relative_path})"
 
 
 class HttpError(Exception):
@@ -101,6 +136,10 @@ class HttpError(Exception):
             text = f"cannot reach {url}: {message}" if url else message
         super().__init__(text)
         self.status = status
+
+
+class ConfigError(Exception):
+    pass
 
 
 class InvalidPackage(Exception):
@@ -142,47 +181,33 @@ class Nugget:
         self.http = http
         self.url = url.rstrip("/")
         self.api_key = api_key
-        self._versions: Dict[str, Set[str]] = {}
-        self._lock = threading.Lock()
 
     def check(self) -> None:
         self.http.json(f"{self.url}/v3/index.json")
 
-    def state(self, package: LocalPackage) -> str:
-        """'absent', 'same' or 'different' (same version, other file) in Nugget."""
-        if not self._has_version(package):
-            return "absent"
+    def state(self, package: LocalPackage) -> Tuple[str, str]:
+        """('absent', 'same' or 'different', why) for the package's version in
+        Nugget. One request per package, so nothing is cached in memory."""
         lower_id = urllib.parse.quote(package.id.lower())
         version = urllib.parse.quote(normalize_version(package.version))
-        leaf = self.http.json(f"{self.url}/v3/catalog0/data/{lower_id}/{version}.json")
+        try:
+            leaf = self.http.json(f"{self.url}/v3/catalog0/data/{lower_id}/{version}.json")
+        except HttpError as error:
+            if error.status == 404:
+                return "absent", "not in Nugget yet"
+            raise
         size = leaf.get("packageSize")
         if isinstance(size, int) and size != package.size:
-            return "different"  # no need to hash the file
+            return "different", (f"Nugget's copy is {format_size(size)}, "
+                                 f"this file {format_size(package.size)}")
         expected = leaf.get("packageHash")
         if not expected:
-            return "same"
-        return "same" if package.sha512() == expected else "different"
+            return "same", "same size; Nugget reports no SHA-512 to compare"
+        if package.sha512() == expected:
+            return "same", "same SHA-512"
+        return "different", "same size, different SHA-512"
 
-    def _has_version(self, package: LocalPackage) -> bool:
-        lower_id = package.id.lower()
-        with self._lock:
-            versions = self._versions.get(lower_id)
-        if versions is None:
-            try:
-                index = self.http.json(
-                    f"{self.url}/v3-flatcontainer/{urllib.parse.quote(lower_id)}/index.json"
-                )
-                versions = set(index.get("versions") or [])
-            except HttpError as error:
-                if error.status != 404:
-                    raise
-                versions = set()
-            with self._lock:
-                self._versions[lower_id] = versions
-        return normalize_version(package.version) in versions
-
-    def upload(self, path: str) -> Tuple[int, str]:
-        size = os.path.getsize(path)
+    def upload(self, path: str, size: int) -> Tuple[int, str]:
         with open(path, "rb") as body:
             try:
                 with self.http.open(
@@ -217,14 +242,33 @@ def normalize_version(version: str) -> str:
 _print_lock = threading.Lock()
 
 
-def say(text: str) -> None:
+def log(text: str) -> None:
     with _print_lock:
-        print(text, flush=True)
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}", flush=True)
 
 
 def warn(text: str) -> None:
     with _print_lock:
-        print(f"warning: {text}", file=sys.stderr, flush=True)
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} warning: {text}",
+              file=sys.stderr, flush=True)
+
+
+def format_size(size: float) -> str:
+    if size < 1024:
+        return f"{int(size)} bytes"
+    for unit in ("KB", "MB", "GB"):
+        size /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} TB"
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02}m {seconds:02}s" if hours else f"{minutes}m {seconds:02}s"
 
 
 def is_package_file(name: str) -> bool:
@@ -234,34 +278,24 @@ def is_package_file(name: str) -> bool:
     return lower.endswith(".nupkg") and not lower.endswith(".symbols.nupkg")
 
 
-def find_packages(roots: List[str], failures: List[Failure],
-                  totals: Dict[str, int]) -> List[Tuple[str, str]]:
-    """(root, path) of every package file, in a stable order."""
-    found: List[Tuple[str, str]] = []
-    seen: Set[str] = set()
-
-    def unreadable(error: OSError) -> None:
-        warn(f"cannot read directory {error.filename}: {error.strerror}")
-        failures.append(Failure(error.filename or "", "", "",
-                                f"directory not readable: {error.strerror}"))
-        totals["unreadable directory"] = totals.get("unreadable directory", 0) + 1
-
-    for root in roots:
-        for directory, subdirectories, files in os.walk(root, onerror=unreadable):
-            subdirectories.sort()  # dated directories: oldest first
-            for name in sorted(files):
-                path = os.path.join(directory, name)
-                if is_package_file(name) and path not in seen:
-                    seen.add(path)
-                    found.append((root, path))
-    return found
+def find_packages(root: str, unreadable: Callable[[OSError], None]) -> Iterator[str]:
+    """Package files under root, one directory at a time and in sorted order
+    (dated directories: oldest first). Only one directory listing is held in
+    memory at a time, per level of depth."""
+    for directory, subdirectories, files in os.walk(root, onerror=unreadable):
+        subdirectories.sort()
+        if os.path.dirname(directory) == root:
+            log(f"Scanning {os.path.relpath(directory, root)}{os.sep}")
+        for name in sorted(files):
+            if is_package_file(name):
+                yield os.path.join(directory, name)
 
 
 def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def read_package(root: str, path: str) -> LocalPackage:
+def read_package(path: str) -> LocalPackage:
     """ID and version from the package's .nuspec."""
     try:
         size = os.path.getsize(path)
@@ -290,23 +324,15 @@ def read_package(root: str, path: str) -> LocalPackage:
                     values[name] = element.text.strip()
     if not values.get("id") or not values.get("version"):
         raise InvalidPackage("the .nuspec has no ID or version")
-    return LocalPackage(path=path, root=root, size=size,
-                        id=values["id"], version=values["version"])
+    return LocalPackage(path=path, size=size, id=values["id"], version=values["version"])
 
 
-def try_read_package(root: str, path: str) -> Union[LocalPackage, Failure]:
-    try:
-        return read_package(root, path)
-    except InvalidPackage as error:
-        return Failure(path, "", "", str(error), root)
-
-
-def move_to_error_dir(failure: Failure, error_dir: str) -> str:
-    """Moves a failed file to the same path relative to error_dir as to its root."""
-    target = os.path.join(error_dir, os.path.relpath(failure.path, failure.root))
+def move_to_error_dir(path: str, root: str, error_dir: str) -> str:
+    """Moves a failed file to the same path relative to error_dir as to root."""
+    target = os.path.join(error_dir, os.path.relpath(path, root))
     os.makedirs(os.path.dirname(target), exist_ok=True)
     try:
-        os.replace(failure.path, target)  # a rename on the same file system
+        os.replace(path, target)  # a rename on the same file system
     except OSError as error:
         if error.errno != errno.EXDEV:
             raise
@@ -315,41 +341,174 @@ def move_to_error_dir(failure: Failure, error_dir: str) -> str:
         partial = target + ".partial"
         if os.path.lexists(partial):
             os.remove(partial)
-        shutil.copy2(failure.path, partial)
+        shutil.copy2(path, partial)
         os.replace(partial, target)
         try:
-            os.remove(failure.path)
+            os.remove(path)
         except OSError:
             os.remove(target)  # not moved after all: keep a single copy
             raise
     return target
 
 
-def upload(copies: List[LocalPackage], nugget: Nugget, skip_existing: bool,
-           dry_run: bool) -> Tuple[str, str, List[LocalPackage]]:
-    """Uploads the first copy of a version; returns (outcome, detail, copies
-    with other content than the uploaded one)."""
-    package = copies[0]
-    differing = [other for other in copies[1:]
-                 if other.size != package.size or other.sha512() != package.sha512()]
-    if skip_existing:
-        state = nugget.state(package)
-        if state == "same":
-            return "present", "", differing
-        if state == "different":
-            return "conflict", "Nugget has a different package with this ID and version", \
-                differing
-    if dry_run:
-        return "would add", "", differing
-    status, body = nugget.upload(package.path)
-    if status == 201:
-        return "added", "", differing
-    if status == 200:
-        return "present", "", differing
-    if status == 409:
-        return "conflict", "Nugget has a different package with this ID and version", \
-            differing
-    return "failed", body, differing
+def process(result: Result, nugget: Nugget, skip_existing: bool, dry_run: bool) -> Result:
+    """Reads, checks and uploads one package file (in a worker thread), and
+    logs the outcome right after its steps."""
+    try:
+        check_and_upload(result, nugget, skip_existing, dry_run)
+    except Exception as error:  # noqa: BLE001 - one bad file must not stop the run
+        result.outcome, result.detail = "failed", f"unexpected error: {error!r}"
+    (log if result.outcome in ("added", "present", "would add") else warn)(result.describe())
+    return result
+
+
+def check_and_upload(result: Result, nugget: Nugget, skip_existing: bool,
+                     dry_run: bool) -> None:
+    log(f"{result.tag} reading {result.relative_path}")
+    try:
+        result.package = package = read_package(result.path)
+    except InvalidPackage as error:
+        result.outcome, result.detail = "unreadable", str(error)
+        return
+    try:
+        why = ""
+        if skip_existing:
+            log(f"{result.tag} {format_size(package.size)}, checking Nugget")
+            state, why = nugget.state(package)
+            if state == "same":
+                result.outcome, result.detail = "present", why
+                return
+            if state == "different":
+                result.outcome, result.detail = "conflict", f"{CONFLICT} ({why})"
+                return
+        else:
+            log(f"{result.tag} {format_size(package.size)}")
+        if dry_run:
+            result.outcome, result.detail = "would add", why
+            return
+        log(f"{result.tag} " + (f"{why}, " if why else "") + "uploading")
+        started = time.monotonic()
+        status, body = nugget.upload(result.path, package.size)
+        took = format_duration(time.monotonic() - started)
+        if status == 201:
+            result.outcome, result.detail = "added", f"HTTP 201 in {took}"
+        elif status == 200:
+            result.outcome, result.detail = "present", f"identical, HTTP 200 in {took}"
+        elif status == 409:
+            result.outcome, result.detail = "conflict", f"{CONFLICT} (HTTP 409)"
+        else:
+            result.outcome, result.detail = "failed", body
+    except Exception as error:  # noqa: BLE001 - reported and counted
+        result.outcome, result.detail = "failed", str(error)
+
+
+class Report:
+    """Counts outcomes, logs them, writes --failures as it goes (nothing is
+    kept per package) and moves failed files to --error-dir."""
+
+    def __init__(self, failures_path: Optional[str], error_dir: Optional[str],
+                 dry_run: bool):
+        self.totals: Dict[str, int] = {}
+        self.files = 0
+        self.failures = 0
+        self.moved = 0
+        self.uploaded_bytes = 0
+        self.error_dir = None if dry_run else error_dir
+        self.failures_file = None
+        if failures_path:
+            try:
+                self.failures_file = open(failures_path, "w", encoding="utf-8")
+            except OSError as error:
+                raise ConfigError(f"cannot write --failures file: {error}") from None
+            self._write("path", "id", "version", "reason")
+
+    def close(self) -> None:
+        if self.failures_file:
+            self.failures_file.close()
+
+    def _write(self, *columns: str) -> None:
+        if self.failures_file:
+            self.failures_file.write("\t".join(" ".join(c.split()) for c in columns) + "\n")
+            self.failures_file.flush()  # complete even if the run is interrupted
+
+    def _count(self, outcome: str) -> None:
+        self.totals[outcome] = self.totals.get(outcome, 0) + 1
+
+    def directory_error(self, error: OSError) -> None:
+        warn(f"cannot read directory {error.filename}: {error.strerror}")
+        self._count("unreadable directory")
+        self.failures += 1
+        self._write(error.filename or "", "", "", f"directory not readable: {error.strerror}")
+
+    def add(self, result: Result) -> None:
+        """Counts a result (already logged by its worker); records and moves failures."""
+        self.files += 1
+        self._count(result.outcome)
+        package = result.package
+        if result.outcome == "added":
+            self.uploaded_bytes += package.size if package else 0
+        if result.outcome in ("added", "present", "would add"):
+            return
+        self.failures += 1
+        self._write(result.path, package.id if package else "",
+                    package.version if package else "", result.detail)
+        if self.error_dir:
+            try:
+                target = move_to_error_dir(result.path, result.root, self.error_dir)
+            except OSError as error:
+                warn(f"{result.tag} cannot move {result.path} to {self.error_dir}: {error}")
+                self._count("not moved")
+                return
+            self.moved += 1
+            log(f"{result.tag} moved to {target}")
+
+    def summary(self) -> str:
+        parts = [f"{self.totals[key]} {label}" for key, label in OUTCOMES if key in self.totals]
+        if self.uploaded_bytes:
+            parts.append(f"{format_size(self.uploaded_bytes)} uploaded")
+        return f"{self.files} package file(s)" + (": " + ", ".join(parts) if parts else "")
+
+
+def run(pool: concurrent.futures.ThreadPoolExecutor, args: argparse.Namespace,
+        nugget: Nugget, report: Report) -> bool:
+    """Feeds package files to the workers as the tree is walked; False when
+    interrupted."""
+    # Only a few packages wait in the queue, however large the tree is.
+    limit = max(1, args.parallel) * 2
+    pending: Set[concurrent.futures.Future] = set()
+
+    def collect() -> None:
+        done, _ = concurrent.futures.wait(pending,
+                                          return_when=concurrent.futures.FIRST_COMPLETED)
+        for future in done:
+            pending.discard(future)
+            report.add(future.result())
+
+    number = 0
+    try:
+        for root in args.root:
+            log(f"Scanning {root}")
+            for path in find_packages(root, report.directory_error):
+                while len(pending) >= limit:
+                    collect()
+                number += 1
+                pending.add(pool.submit(process, Result(number, root, path), nugget,
+                                        args.skip_existing, args.dry_run))
+        log(f"Scan complete: {number} package file(s) found, waiting for the last uploads")
+        while pending:
+            collect()
+        return True
+    except KeyboardInterrupt:
+        for future in pending:
+            future.cancel()  # those not started yet
+        running = {future for future in pending if not future.cancelled()}
+        pending.clear()
+        pending.update(running)
+        warn(f"interrupted: finishing the {len(pending)} package(s) in progress "
+             "(Ctrl-C again to stop at once)")
+        while pending:
+            collect()
+        return False
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -370,9 +529,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
                         help="upload even what Nugget already has")
     parser.add_argument("--dry-run", action="store_true",
-                        help="only list what would be uploaded")
+                        help="only log what would be uploaded")
     parser.add_argument("--failures", metavar="FILE",
-                        help="write packages that could not be uploaded to FILE (TSV)")
+                        help="write packages that could not be uploaded to FILE (TSV), "
+                             "as they happen")
     parser.add_argument("--error-dir", metavar="DIR",
                         help="move packages that could not be uploaded to DIR, under "
                              "the same relative path as under --root "
@@ -414,91 +574,49 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     return args
 
 
-def run(pool: concurrent.futures.ThreadPoolExecutor, args: argparse.Namespace,
-        nugget: Nugget, failures: List[Failure], totals: Dict[str, int]) -> None:
-    def fail(failure: Failure) -> None:
-        failures.append(failure)
-        if not args.error_dir or not failure.root or args.dry_run:
-            return
-        try:
-            move_to_error_dir(failure, args.error_dir)
-            totals["moved to error dir"] = totals.get("moved to error dir", 0) + 1
-        except OSError as error:
-            warn(f"cannot move {failure.path} to {args.error_dir}: {error}")
-            totals["not moved to error dir"] = totals.get("not moved to error dir", 0) + 1
-
-    files = find_packages(args.root, failures, totals)
-    say(f"Found {len(files)} package file(s) under {', '.join(args.root)}, "
-        "reading their manifests")
-
-    versions: Dict[Tuple[str, str], List[LocalPackage]] = {}
-    for result in pool.map(lambda found: try_read_package(*found), files):
-        if isinstance(result, Failure):
-            warn(f"{result.path}: {result.reason}")
-            fail(result)
-            totals["unreadable"] = totals.get("unreadable", 0) + 1
-        else:
-            versions.setdefault(result.key, []).append(result)
-    duplicates = sum(len(copies) - 1 for copies in versions.values())
-    say(f"Uploading {len(versions)} package version(s) to {nugget.url}"
-        + (f" ({duplicates} duplicate file(s), uploaded once)" if duplicates else "")
-        + (" (dry run)" if args.dry_run else ""))
-
-    width = len(str(len(versions)))
-    futures = {pool.submit(upload, copies, nugget, args.skip_existing, args.dry_run): copies
-               for copies in versions.values()}
-    try:
-        for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
-            package = futures[future][0]
-            try:
-                outcome, detail, differing = future.result()
-            except Exception as error:  # noqa: BLE001 - reported and counted
-                outcome, detail, differing = "failed", str(error), []
-            totals[outcome] = totals.get(outcome, 0) + 1
-            if outcome in ("failed", "conflict"):
-                fail(Failure(package.path, package.id, package.version, detail, package.root))
-                detail = f"{detail} ({package.display_path})"
-            say(f"[{done:>{width}}/{len(versions)}] {outcome:<10} {package.id} "
-                f"{package.version}" + (f": {detail}" if detail else ""))
-            for other in differing:
-                reason = f"differs from {package.path}, the copy used for this version"
-                warn(f"{other.display_path}: {reason}")
-                fail(Failure(other.path, other.id, other.version, reason, other.root))
-                totals["differing copy"] = totals.get("differing copy", 0) + 1
-    except KeyboardInterrupt:
-        for future in futures:
-            future.cancel()  # stop at the uploads already running
-        raise
-
-
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+    started = time.monotonic()
     http = Http(args.ca_file, args.insecure, args.timeout)
     nugget = Nugget(http, args.nugget_url, args.nugget_api_key or "")
+    log(f"Checking Nugget at {nugget.url}")
     nugget.check()
+    log("Nugget is reachable")
+    log(f"Importing from {', '.join(args.root)}")
+    if args.dry_run:
+        log("Dry run: nothing is uploaded or moved")
+    elif args.error_dir:
+        log(f"Files that cannot be uploaded are moved to {args.error_dir}")
+    else:
+        log("Files that cannot be uploaded stay where they are (no --error-dir)")
+    if args.failures:
+        log(f"Failures are listed in {args.failures}")
+    log(f"{max(1, args.parallel)} package(s) at a time; "
+        + ("versions Nugget already has are skipped" if args.skip_existing
+           else "uploading even versions Nugget already has"))
 
-    totals: Dict[str, int] = {}
-    failures: List[Failure] = []
-    with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
-        run(pool, args, nugget, failures, totals)
+    report = Report(args.failures, args.error_dir, args.dry_run)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max(1, args.parallel)) as pool:
+            completed = run(pool, args, nugget, report)
+    finally:
+        report.close()
 
-    if args.failures and failures:
-        with open(args.failures, "w", encoding="utf-8") as report:
-            report.write("path\tid\tversion\treason\n")
-            for failure in failures:
-                reason = " ".join(failure.reason.split())
-                report.write(f"{failure.path}\t{failure.id}\t{failure.version}\t{reason}\n")
-        say(f"Wrote {len(failures)} failure(s) to {args.failures}")
-    if totals.get("moved to error dir"):
-        say(f"Moved {totals['moved to error dir']} failed file(s) to {args.error_dir}")
-    say("Done: " + (", ".join(f"{n} {k}" for k, n in sorted(totals.items())) or "nothing to do"))
-    return 1 if failures else 0
+    took = format_duration(time.monotonic() - started)
+    log(("Done" if completed else "Interrupted") + f" after {took}: {report.summary()}")
+    if report.moved:
+        log(f"Moved {report.moved} file(s) to {args.error_dir}")
+    if args.failures and report.failures:
+        log(f"Listed {report.failures} failure(s) in {args.failures}")
+    if not completed:
+        return 130
+    return 1 if report.failures else 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv[1:]))
-    except HttpError as error:
+    except (HttpError, ConfigError) as error:
         print(f"error: {error}", file=sys.stderr)
         sys.exit(2)
     except KeyboardInterrupt:

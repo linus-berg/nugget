@@ -255,11 +255,17 @@ scripts/import-from-directory.py \
 * Any layout works: ID and version are read from each package's `.nuspec`,
   not from its path. `--root` is required and can be repeated. Symbol
   packages (`.snupkg`, `.symbols.nupkg`) are ignored.
+* Packages are uploaded while the tree is walked, one directory at a time,
+  so memory use stays flat however many files there are. Every step is
+  logged with a timestamp: each directory below the root as it is scanned,
+  and per package its path, ID, version, size, what Nugget already has, the
+  upload and its result. `--failures` is written as failures happen.
 * A version stored more than once (e.g. in several dated directories) is
-  uploaded once, from the first copy in path order. A copy with different
-  content is reported in `--failures`, never uploaded.
+  uploaded from the first copy found; later copies are compared with it in
+  Nugget, so identical ones are skipped and different ones are conflicts.
+  `--dry-run` uploads nothing, so it cannot spot these duplicates.
 * `--error-dir DIR` moves every file that was not uploaded (unreadable,
-  failed, conflict, differing copy) to the same path under `DIR` as under
+  failed, conflict) to the same path under `DIR` as under
   `--root`, e.g. `ROOT/a/b.nupkg` to `DIR/a/b.nupkg`, so you can see what
   failed in which directory. Move a file back under `--root` to try it again.
   It needs a single `--root`, must not be inside it, and moves nothing with
